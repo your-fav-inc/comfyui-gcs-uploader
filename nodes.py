@@ -2,19 +2,21 @@
 
 Flow
 ----
-1. The caller submits the workflow with two inputs on this node: ``exchange_url`` (a backend
-   endpoint) and a per-task, single-purpose ``token``.
-2. When the node runs it knows the real batch size, so it POSTs ``{token, count, content_type}``
-   to ``exchange_url`` and receives ``{object_keys[], signed_urls[]}``. Signed URLs are therefore
-   minted at upload time, not at submit time, and never sit in a queue waiting to expire.
+1. The caller submits the workflow with two inputs on this node: ``webhook_url`` (a backend
+   endpoint) and a per-task ``token`` with a short TTL and a small use budget.
+2. When the node runs it knows the real batch size, so it POSTs
+   ``{token, event: "request_urls", count, content_type}`` to ``webhook_url`` and receives
+   ``{object_keys[], signed_urls[]}``. Signed URLs are minted at upload time, not at submit time,
+   so queue time can never expire them. Each ``request_urls`` call consumes one use of the token.
 3. Each image is encoded and ``PUT`` to its signed URL.
-4. The object keys are returned through ``ui`` so they appear under ``outputs[<node_id>]`` in the
-   ComfyUI history / RunComfy webhook payload as ``{"object_key": ["key-1", ...]}``
-   (ComfyUI flattens every ``ui`` value into a list).
+4. The node POSTs ``{token, event: "completed", object_keys}`` to the same ``webhook_url`` so the
+   backend can mark the task done without trusting a third-party callback. This call validates the
+   token but does not consume a use.
+5. The object keys are also returned through ``ui`` so they appear under ``outputs[<node_id>]`` in
+   the ComfyUI history as ``{"object_key": ["key-1", ...]}`` (ComfyUI flattens ``ui`` values).
 
-No Google SDK and no long-lived credentials ever reach the ComfyUI machine. The exchange endpoint is
-expected to be idempotent for a token until the task reaches a terminal state, so retrying the
-exchange after a network hiccup is safe.
+No Google SDK and no long-lived credentials ever reach the ComfyUI machine. Upload failures are not
+reported by the node; the backend learns about them from the runner's own failure callback.
 
 Python >= 3.9; only depends on packages ComfyUI already ships with (``numpy``, ``Pillow``,
 ``requests``).
@@ -39,13 +41,13 @@ _FORMATS: dict[str, tuple[str, str]] = {
 }
 
 _DEFAULT_TIMEOUT_S = 120
-_EXCHANGE_TIMEOUT_S = 30
+_WEBHOOK_TIMEOUT_S = 30
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_S = 1.0
 
 
 class GcsUploadError(RuntimeError):
-    """Raised when the exchange or an upload fails; fails the whole prompt on purpose."""
+    """Raised when a webhook call or an upload fails; fails the whole prompt on purpose."""
 
 
 def tensor_to_pil(image: Any) -> Image.Image:
@@ -113,52 +115,76 @@ def _pick(payload: dict[str, Any], *names: str) -> Any:
     return None
 
 
-def exchange_token(
-    exchange_url: str,
-    token: str,
-    count: int,
-    content_type: str,
-    timeout_s: float = _EXCHANGE_TIMEOUT_S,
-    sleep: Callable[[float], None] = time.sleep,
-) -> tuple[list[str], list[str]]:
-    """POST the one-time token to the backend and get ``(object_keys, signed_urls)`` for ``count`` images."""
-    if not exchange_url.strip():
-        raise GcsUploadError("'exchange_url' must not be empty")
-    if not token.strip():
+def _post_webhook(
+    webhook_url: str,
+    body: dict[str, Any],
+    what: str,
+    timeout_s: float,
+    sleep: Callable[[float], None],
+) -> requests.Response:
+    if not webhook_url.strip():
+        raise GcsUploadError("'webhook_url' must not be empty")
+    if not str(body.get("token", "")).strip():
         raise GcsUploadError("'token' must not be empty")
-
-    body = {"token": token, "count": count, "content_type": content_type}
-    response = _request_with_retry(
-        "token exchange",
+    return _request_with_retry(
+        what,
         lambda: requests.post(
-            exchange_url,
+            webhook_url,
             json=body,
             headers={"Content-Type": "application/json"},
             timeout=timeout_s,
         ),
         sleep=sleep,
     )
+
+
+def request_upload_urls(
+    webhook_url: str,
+    token: str,
+    count: int,
+    content_type: str,
+    timeout_s: float = _WEBHOOK_TIMEOUT_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[list[str], list[str]]:
+    """Send ``event=request_urls`` and get ``(object_keys, signed_urls)`` for ``count`` images."""
+    body = {
+        "token": token,
+        "event": "request_urls",
+        "count": count,
+        "content_type": content_type,
+    }
+    response = _post_webhook(webhook_url, body, "request_urls", timeout_s, sleep)
     try:
         payload = response.json()
     except ValueError as exc:
-        raise GcsUploadError(
-            f"token exchange returned non-JSON body: {response.text[:300]}"
-        ) from exc
+        raise GcsUploadError(f"request_urls returned non-JSON body: {response.text[:300]}") from exc
     if not isinstance(payload, dict):
-        raise GcsUploadError(f"token exchange returned unexpected payload: {payload!r}")
+        raise GcsUploadError(f"request_urls returned unexpected payload: {payload!r}")
 
     keys = _pick(payload, "object_keys", "objectKeys")
     urls = _pick(payload, "signed_urls", "signedUrls")
     for name, value in (("object_keys", keys), ("signed_urls", urls)):
         if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
             raise GcsUploadError(
-                f"token exchange response '{name}' must be a list of non-empty strings"
+                f"request_urls response '{name}' must be a list of non-empty strings"
             )
     if not (len(keys) == len(urls) == count):
         raise GcsUploadError(
-            f"token exchange size mismatch: requested {count}, got keys={len(keys)}, urls={len(urls)}"
+            f"request_urls size mismatch: requested {count}, got keys={len(keys)}, urls={len(urls)}"
         )
     return keys, urls
+
+
+def report_completed(
+    webhook_url: str,
+    token: str,
+    object_keys: list[str],
+    timeout_s: float = _WEBHOOK_TIMEOUT_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Send ``event=completed`` with the uploaded keys. Any non-2xx after retries fails the prompt."""
+    body = {"token": token, "event": "completed", "object_keys": object_keys}
+    _post_webhook(webhook_url, body, "completed", timeout_s, sleep)
 
 
 def put_with_retry(
@@ -181,7 +207,7 @@ def put_with_retry(
 
 
 class UploadImagesToGcs:
-    """Exchange a one-time token for signed URLs, then upload each image of the batch to GCS."""
+    """Request signed URLs via the webhook, upload the batch to GCS, then report completion."""
 
     CATEGORY = "image/upload"
     FUNCTION = "upload"
@@ -193,19 +219,20 @@ class UploadImagesToGcs:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "exchange_url": (
+                "webhook_url": (
                     "STRING",
                     {
                         "default": "",
-                        "tooltip": "Backend endpoint that swaps the token for signed PUT URLs "
-                        "(POST JSON {token, count, content_type}).",
+                        "tooltip": "Backend endpoint receiving JSON POSTs: "
+                        "event=request_urls (returns signed PUT URLs) and event=completed.",
                     },
                 ),
                 "token": (
                     "STRING",
                     {
                         "default": "",
-                        "tooltip": "Per-task upload token issued by the backend when the job was submitted.",
+                        "tooltip": "Per-task upload token issued by the backend when the job was "
+                        "submitted (short TTL, limited uses).",
                     },
                 ),
                 "format": (list(_FORMATS.keys()), {"default": "png"}),
@@ -225,7 +252,7 @@ class UploadImagesToGcs:
     def upload(
         self,
         images: Sequence[Any],
-        exchange_url: str,
+        webhook_url: str,
         token: str,
         format: str = "png",
         quality: int = 95,
@@ -236,7 +263,7 @@ class UploadImagesToGcs:
             raise GcsUploadError("received an empty image batch")
 
         _, content_type = _FORMATS[format]
-        keys, urls = exchange_token(exchange_url, token, batch_size, content_type)
+        keys, urls = request_upload_urls(webhook_url, token, batch_size, content_type)
 
         for index, (image, url) in enumerate(zip(images, urls)):
             data = encode_image(image, format, quality)
@@ -245,8 +272,9 @@ class UploadImagesToGcs:
             except GcsUploadError as exc:
                 raise GcsUploadError(f"image #{index} ({keys[index]}): {exc}") from exc
 
+        report_completed(webhook_url, token, keys)
         return {"ui": {"object_key": keys}}
 
 
 NODE_CLASS_MAPPINGS = {"UploadImagesToGcs": UploadImagesToGcs}
-NODE_DISPLAY_NAME_MAPPINGS = {"UploadImagesToGcs": "Upload Images to GCS (token exchange)"}
+NODE_DISPLAY_NAME_MAPPINGS = {"UploadImagesToGcs": "Upload Images to GCS (webhook)"}

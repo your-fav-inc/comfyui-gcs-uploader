@@ -13,11 +13,12 @@ from nodes import (
     GcsUploadError,
     UploadImagesToGcs,
     encode_image,
-    exchange_token,
     put_with_retry,
+    report_completed,
+    request_upload_urls,
 )
 
-EXCHANGE_URL = "https://backend.example/image.v1.UploadService/ExchangeUploadToken"
+WEBHOOK_URL = "https://backend.example/webhooks/comfy-upload"
 NO_SLEEP = mock.patch.object(nodes.time, "sleep", lambda _: None)
 
 
@@ -33,7 +34,7 @@ def _response(status: int, text: str = "", json_body: object = None) -> mock.Moc
     return response
 
 
-def _exchange_ok(keys: list[str], urls: list[str], camel: bool = False) -> mock.Mock:
+def _urls_ok(keys: list[str], urls: list[str], camel: bool = False) -> mock.Mock:
     body = (
         {"objectKeys": keys, "signedUrls": urls}
         if camel
@@ -72,27 +73,28 @@ def test_encode_accepts_torch_like_tensor():
     assert Image.open(io.BytesIO(data)).size == (6, 4)
 
 
-# --- exchange_token ----------------------------------------------------------
+# --- request_upload_urls -----------------------------------------------------
 
 
-def test_exchange_posts_json_and_parses_snake_case():
+def test_request_urls_posts_event_and_parses_snake_case():
     with mock.patch.object(
-        requests, "post", return_value=_exchange_ok(["k0", "k1"], ["u0", "u1"])
+        requests, "post", return_value=_urls_ok(["k0", "k1"], ["u0", "u1"])
     ) as post:
-        keys, urls = exchange_token(EXCHANGE_URL, "tok", 2, "image/png", sleep=lambda _: None)
+        keys, urls = request_upload_urls(WEBHOOK_URL, "tok", 2, "image/png", sleep=lambda _: None)
     assert (keys, urls) == (["k0", "k1"], ["u0", "u1"])
-    assert post.call_args.args[0] == EXCHANGE_URL
+    assert post.call_args.args[0] == WEBHOOK_URL
     assert post.call_args.kwargs["json"] == {
         "token": "tok",
+        "event": "request_urls",
         "count": 2,
         "content_type": "image/png",
     }
     assert post.call_args.kwargs["headers"] == {"Content-Type": "application/json"}
 
 
-def test_exchange_accepts_camel_case():
-    with mock.patch.object(requests, "post", return_value=_exchange_ok(["k0"], ["u0"], camel=True)):
-        assert exchange_token(EXCHANGE_URL, "tok", 1, "image/png", sleep=lambda _: None) == (
+def test_request_urls_accepts_camel_case():
+    with mock.patch.object(requests, "post", return_value=_urls_ok(["k0"], ["u0"], camel=True)):
+        assert request_upload_urls(WEBHOOK_URL, "tok", 1, "image/png", sleep=lambda _: None) == (
             ["k0"],
             ["u0"],
         )
@@ -100,19 +102,19 @@ def test_exchange_accepts_camel_case():
 
 @pytest.mark.parametrize(
     ("url", "token"),
-    [("", "tok"), ("   ", "tok"), (EXCHANGE_URL, ""), (EXCHANGE_URL, "  ")],
+    [("", "tok"), ("   ", "tok"), (WEBHOOK_URL, ""), (WEBHOOK_URL, "  ")],
 )
-def test_exchange_rejects_missing_inputs(url, token):
+def test_request_urls_rejects_missing_inputs(url, token):
     with pytest.raises(GcsUploadError):
-        exchange_token(url, token, 1, "image/png")
+        request_upload_urls(url, token, 1, "image/png")
 
 
-def test_exchange_rejects_size_mismatch():
+def test_request_urls_rejects_size_mismatch():
     with (
-        mock.patch.object(requests, "post", return_value=_exchange_ok(["k0"], ["u0"])),
+        mock.patch.object(requests, "post", return_value=_urls_ok(["k0"], ["u0"])),
         pytest.raises(GcsUploadError, match="size mismatch"),
     ):
-        exchange_token(EXCHANGE_URL, "tok", 2, "image/png", sleep=lambda _: None)
+        request_upload_urls(WEBHOOK_URL, "tok", 2, "image/png", sleep=lambda _: None)
 
 
 @pytest.mark.parametrize(
@@ -124,43 +126,65 @@ def test_exchange_rejects_size_mismatch():
         ["not", "a", "dict"],
     ],
 )
-def test_exchange_rejects_malformed_payload(body):
+def test_request_urls_rejects_malformed_payload(body):
     with (
         mock.patch.object(requests, "post", return_value=_response(200, json_body=body)),
         pytest.raises(GcsUploadError),
     ):
-        exchange_token(EXCHANGE_URL, "tok", 1, "image/png", sleep=lambda _: None)
+        request_upload_urls(WEBHOOK_URL, "tok", 1, "image/png", sleep=lambda _: None)
 
 
-def test_exchange_rejects_non_json_body():
+def test_request_urls_rejects_non_json_body():
     with (
         mock.patch.object(requests, "post", return_value=_response(200, text="<html>")),
         pytest.raises(GcsUploadError, match="non-JSON"),
     ):
-        exchange_token(EXCHANGE_URL, "tok", 1, "image/png", sleep=lambda _: None)
+        request_upload_urls(WEBHOOK_URL, "tok", 1, "image/png", sleep=lambda _: None)
 
 
-def test_exchange_fails_fast_on_4xx_with_connect_error_message():
-    body = {"code": "permission_denied", "message": "token already used"}
+def test_request_urls_fails_fast_on_4xx_with_error_message():
+    body = {"code": "permission_denied", "message": "token exhausted"}
     with (
         mock.patch.object(
             requests,
             "post",
-            return_value=_response(403, text='{"message":"token already used"}', json_body=body),
+            return_value=_response(403, text='{"message":"token exhausted"}', json_body=body),
         ) as post,
-        pytest.raises(GcsUploadError, match="HTTP 403.*token already used"),
+        pytest.raises(GcsUploadError, match="HTTP 403.*token exhausted"),
     ):
-        exchange_token(EXCHANGE_URL, "tok", 1, "image/png", sleep=lambda _: None)
+        request_upload_urls(WEBHOOK_URL, "tok", 1, "image/png", sleep=lambda _: None)
     post.assert_called_once()
 
 
-def test_exchange_retries_on_5xx_then_succeeds():
-    responses = [_response(503), _exchange_ok(["k0"], ["u0"])]
+def test_request_urls_retries_on_5xx_then_succeeds():
+    responses = [_response(503), _urls_ok(["k0"], ["u0"])]
     sleeps: list[float] = []
     with mock.patch.object(requests, "post", side_effect=responses) as post:
-        exchange_token(EXCHANGE_URL, "tok", 1, "image/png", sleep=sleeps.append)
+        request_upload_urls(WEBHOOK_URL, "tok", 1, "image/png", sleep=sleeps.append)
     assert post.call_count == 2
     assert sleeps == [1.0]
+
+
+# --- report_completed --------------------------------------------------------
+
+
+def test_report_completed_posts_keys():
+    with mock.patch.object(requests, "post", return_value=_response(200)) as post:
+        report_completed(WEBHOOK_URL, "tok", ["k0", "k1"], sleep=lambda _: None)
+    assert post.call_args.kwargs["json"] == {
+        "token": "tok",
+        "event": "completed",
+        "object_keys": ["k0", "k1"],
+    }
+
+
+def test_report_completed_retries_then_fails():
+    with (
+        mock.patch.object(requests, "post", return_value=_response(500)) as post,
+        pytest.raises(GcsUploadError, match="completed failed after 3"),
+    ):
+        report_completed(WEBHOOK_URL, "tok", ["k0"], sleep=lambda _: None)
+    assert post.call_count == 3
 
 
 # --- put_with_retry ----------------------------------------------------------
@@ -201,55 +225,60 @@ def test_put_gives_up_after_max_attempts():
 # --- node --------------------------------------------------------------------
 
 
-def test_node_exchanges_by_batch_size_uploads_and_returns_keys():
+def test_node_requests_urls_uploads_reports_and_returns_keys():
     keys = ["req/0.png", "req/1.png"]
     urls = ["https://u/0", "https://u/1"]
     with (
         NO_SLEEP,
-        mock.patch.object(requests, "post", return_value=_exchange_ok(keys, urls)) as post,
+        mock.patch.object(
+            requests, "post", side_effect=[_urls_ok(keys, urls), _response(200)]
+        ) as post,
         mock.patch.object(requests, "put", return_value=_response(200)) as put,
     ):
-        result = UploadImagesToGcs().upload(
-            [_image(), _image()], EXCHANGE_URL, "tok", format="jpeg"
-        )
+        result = UploadImagesToGcs().upload([_image(), _image()], WEBHOOK_URL, "tok", format="jpeg")
     assert result == {"ui": {"object_key": keys}}
-    assert post.call_args.kwargs["json"]["count"] == 2
-    assert post.call_args.kwargs["json"]["content_type"] == "image/jpeg"
+    first, second = post.call_args_list
+    assert first.kwargs["json"]["event"] == "request_urls"
+    assert first.kwargs["json"]["count"] == 2
+    assert first.kwargs["json"]["content_type"] == "image/jpeg"
+    assert second.kwargs["json"] == {"token": "tok", "event": "completed", "object_keys": keys}
     assert [c.args[0] for c in put.call_args_list] == urls
     assert all(c.kwargs["headers"] == {"Content-Type": "image/jpeg"} for c in put.call_args_list)
 
 
 def test_node_rejects_empty_batch():
     with pytest.raises(GcsUploadError, match="empty image batch"):
-        UploadImagesToGcs().upload([], EXCHANGE_URL, "tok")
+        UploadImagesToGcs().upload([], WEBHOOK_URL, "tok")
 
 
-def test_node_does_not_upload_when_exchange_fails():
+def test_node_does_not_upload_when_request_urls_fails():
     with (
         NO_SLEEP,
-        mock.patch.object(requests, "post", return_value=_response(403, "nope")),
+        mock.patch.object(requests, "post", return_value=_response(403, "nope")) as post,
         mock.patch.object(requests, "put") as put,
-        pytest.raises(GcsUploadError, match="token exchange"),
+        pytest.raises(GcsUploadError, match="request_urls"),
     ):
-        UploadImagesToGcs().upload([_image()], EXCHANGE_URL, "tok")
+        UploadImagesToGcs().upload([_image()], WEBHOOK_URL, "tok")
     put.assert_not_called()
+    post.assert_called_once()  # no "completed" callback either
 
 
-def test_node_error_mentions_failing_key():
+def test_node_does_not_report_completed_when_upload_fails():
     with (
         NO_SLEEP,
         mock.patch.object(
-            requests, "post", return_value=_exchange_ok(["req/0.png"], ["https://u"])
-        ),
+            requests, "post", return_value=_urls_ok(["req/0.png"], ["https://u"])
+        ) as post,
         mock.patch.object(requests, "put", return_value=_response(403)),
         pytest.raises(GcsUploadError, match=r"image #0 \(req/0.png\)"),
     ):
-        UploadImagesToGcs().upload([_image()], EXCHANGE_URL, "tok")
+        UploadImagesToGcs().upload([_image()], WEBHOOK_URL, "tok")
+    assert [c.kwargs["json"]["event"] for c in post.call_args_list] == ["request_urls"]
 
 
 def test_node_metadata_matches_comfy_conventions():
     assert UploadImagesToGcs.OUTPUT_NODE is True
     assert UploadImagesToGcs.RETURN_TYPES == ()
     required = UploadImagesToGcs.INPUT_TYPES()["required"]
-    assert set(required) == {"images", "exchange_url", "token", "format"}
+    assert set(required) == {"images", "webhook_url", "token", "format"}
     assert nodes.NODE_CLASS_MAPPINGS["UploadImagesToGcs"] is UploadImagesToGcs
