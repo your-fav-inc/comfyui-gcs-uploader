@@ -42,6 +42,7 @@ Python ≥ 3.9. No `pip install` step is needed on a stock ComfyUI environment.
 | `format`          | enum     | `png` (default) / `jpeg` / `webp`. Determines the `Content-Type` sent to the backend and to GCS. |
 | `quality`         | `INT`    | Optional, `jpeg`/`webp` only. Default 95.                                               |
 | `timeout_seconds` | `INT`    | Optional per-upload timeout. Default 120. (Webhook calls use a fixed 30s.)              |
+| `task_id`         | `STRING` | Optional. Your backend's task id, echoed into every `log` event and stdout line for correlation. |
 
 **Output** — this is an `OUTPUT_NODE`. It also returns the keys via `ui`, so they show up in the
 ComfyUI history (and any wrapper that forwards it) as:
@@ -84,6 +85,19 @@ Sent after **every** image has been uploaded successfully:
 ```
 
 Any `2xx` response is fine; the body is ignored.
+
+### 3. `log` — best-effort progress, never retried, never fatal
+
+```json
+{"token": "<token>", "event": "log", "stage": "node.uploaded", "level": "info",
+ "message": "", "fields": {"index": 0, "object_key": "requests/abc/0.png", "bytes": 812345,
+                           "elapsed_ms": 430, "task_id": "abc"}}
+```
+
+Stages emitted: `node.started` (`batch_size`, `format`), one `node.uploaded` per image,
+`node.failed` (`level=error`, `message` is the error text) before the prompt fails. The same line
+is also printed to ComfyUI stdout. A `log` call makes exactly one HTTP attempt with a 10s timeout
+and swallows every error; the backend may respond with anything.
 
 ### Backend contract
 

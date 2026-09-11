@@ -14,9 +14,13 @@ Flow
    token but does not consume a use.
 5. The object keys are also returned through ``ui`` so they appear under ``outputs[<node_id>]`` in
    the ComfyUI history as ``{"object_key": ["key-1", ...]}`` (ComfyUI flattens ``ui`` values).
+6. Along the way the node POSTs best-effort ``{token, event: "log", stage, level, message, fields}``
+   progress events (``node.started`` / ``node.uploaded`` / ``node.failed``) so the backend can write
+   them to its own logging with the task id attached. Log calls never retry and never raise.
 
-No Google SDK and no long-lived credentials ever reach the ComfyUI machine. Upload failures are not
-reported by the node; the backend learns about them from the runner's own failure callback.
+No Google SDK and no long-lived credentials ever reach the ComfyUI machine. Upload failures still
+fail the prompt; the ``node.failed`` log is informational and the runner's own failure callback
+remains the source of truth for the task state.
 
 Python >= 3.9; only depends on packages ComfyUI already ships with (``numpy``, ``Pillow``,
 ``requests``).
@@ -24,6 +28,7 @@ Python >= 3.9; only depends on packages ComfyUI already ships with (``numpy``, `
 
 from __future__ import annotations
 
+import contextlib
 import io
 import time
 from collections.abc import Callable, Sequence
@@ -42,6 +47,11 @@ _FORMATS: dict[str, tuple[str, str]] = {
 
 _DEFAULT_TIMEOUT_S = 120
 _WEBHOOK_TIMEOUT_S = 30
+_LOG_TIMEOUT_S = 10
+
+STAGE_STARTED = "node.started"
+STAGE_UPLOADED = "node.uploaded"
+STAGE_FAILED = "node.failed"
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_S = 1.0
 
@@ -187,6 +197,38 @@ def report_completed(
     _post_webhook(webhook_url, body, "completed", timeout_s, sleep)
 
 
+def log_event(
+    webhook_url: str,
+    token: str,
+    stage: str,
+    message: str = "",
+    level: str = "info",
+    fields: dict[str, Any] | None = None,
+    task_id: str = "",
+    timeout_s: float = _LOG_TIMEOUT_S,
+) -> None:
+    """Best-effort ``event=log``: one attempt, swallow everything. Also mirrors to stdout."""
+    body: dict[str, Any] = {
+        "token": token,
+        "event": "log",
+        "stage": stage,
+        "level": level,
+        "message": message,
+        "fields": {**(fields or {}), **({"task_id": task_id} if task_id else {})},
+    }
+    print(f"[UploadImagesToGcs] {stage} task_id={task_id or '-'} {message} {body['fields']}")
+    if not webhook_url.strip() or not token.strip():
+        return
+    # logging must never fail the prompt
+    with contextlib.suppress(Exception):
+        requests.post(
+            webhook_url,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=timeout_s,
+        )
+
+
 def put_with_retry(
     url: str,
     data: bytes,
@@ -246,6 +288,13 @@ class UploadImagesToGcs:
                     "INT",
                     {"default": _DEFAULT_TIMEOUT_S, "min": 1, "max": 3600},
                 ),
+                "task_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Backend task id, only used to correlate logs. Injected per job.",
+                    },
+                ),
             },
         }
 
@@ -257,22 +306,39 @@ class UploadImagesToGcs:
         format: str = "png",
         quality: int = 95,
         timeout_seconds: int = _DEFAULT_TIMEOUT_S,
+        task_id: str = "",
     ):
         batch_size = len(images)
         if batch_size == 0:
             raise GcsUploadError("received an empty image batch")
 
         _, content_type = _FORMATS[format]
-        keys, urls = request_upload_urls(webhook_url, token, batch_size, content_type)
+        log = lambda stage, message="", level="info", **fields: log_event(  # noqa: E731
+            webhook_url, token, stage, message, level, fields, task_id
+        )
+        log(STAGE_STARTED, batch_size=batch_size, format=format)
 
-        for index, (image, url) in enumerate(zip(images, urls)):
-            data = encode_image(image, format, quality)
-            try:
-                put_with_retry(url, data, content_type, timeout_s=timeout_seconds)
-            except GcsUploadError as exc:
-                raise GcsUploadError(f"image #{index} ({keys[index]}): {exc}") from exc
+        try:
+            keys, urls = request_upload_urls(webhook_url, token, batch_size, content_type)
+            for index, (image, url) in enumerate(zip(images, urls)):
+                data = encode_image(image, format, quality)
+                started = time.monotonic()
+                try:
+                    put_with_retry(url, data, content_type, timeout_s=timeout_seconds)
+                except GcsUploadError as exc:
+                    raise GcsUploadError(f"image #{index} ({keys[index]}): {exc}") from exc
+                log(
+                    STAGE_UPLOADED,
+                    index=index,
+                    object_key=keys[index],
+                    bytes=len(data),
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                )
+            report_completed(webhook_url, token, keys)
+        except GcsUploadError as exc:
+            log(STAGE_FAILED, str(exc), level="error")
+            raise
 
-        report_completed(webhook_url, token, keys)
         return {"ui": {"object_key": keys}}
 
 

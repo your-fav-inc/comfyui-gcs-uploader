@@ -13,6 +13,7 @@ from nodes import (
     GcsUploadError,
     UploadImagesToGcs,
     encode_image,
+    log_event,
     put_with_retry,
     report_completed,
     request_upload_urls,
@@ -222,26 +223,79 @@ def test_put_gives_up_after_max_attempts():
     assert put.call_count == 3
 
 
+# --- log_event ---------------------------------------------------------------
+
+
+def test_log_event_posts_once_and_attaches_task_id():
+    with mock.patch.object(requests, "post", return_value=_response(200)) as post:
+        log_event(WEBHOOK_URL, "tok", "node.started", fields={"batch_size": 2}, task_id="t-1")
+    post.assert_called_once()
+    assert post.call_args.kwargs["json"] == {
+        "token": "tok",
+        "event": "log",
+        "stage": "node.started",
+        "level": "info",
+        "message": "",
+        "fields": {"batch_size": 2, "task_id": "t-1"},
+    }
+
+
+def test_log_event_never_raises():
+    with mock.patch.object(requests, "post", side_effect=requests.ConnectionError("down")):
+        log_event(WEBHOOK_URL, "tok", "node.failed", "boom", level="error")
+
+
+def test_log_event_skips_network_without_webhook_or_token():
+    with mock.patch.object(requests, "post") as post:
+        log_event("", "tok", "node.started")
+        log_event(WEBHOOK_URL, "", "node.started")
+    post.assert_not_called()
+
+
 # --- node --------------------------------------------------------------------
+
+
+def _events(post: mock.Mock) -> list[str]:
+    return [c.kwargs["json"]["event"] for c in post.call_args_list]
+
+
+def _stages(post: mock.Mock) -> list[str]:
+    return [
+        c.kwargs["json"]["stage"] for c in post.call_args_list if c.kwargs["json"]["event"] == "log"
+    ]
 
 
 def test_node_requests_urls_uploads_reports_and_returns_keys():
     keys = ["req/0.png", "req/1.png"]
     urls = ["https://u/0", "https://u/1"]
+    log_ok = _response(200)
     with (
         NO_SLEEP,
         mock.patch.object(
-            requests, "post", side_effect=[_urls_ok(keys, urls), _response(200)]
+            requests,
+            "post",
+            side_effect=[log_ok, _urls_ok(keys, urls), log_ok, log_ok, _response(200)],
         ) as post,
         mock.patch.object(requests, "put", return_value=_response(200)) as put,
     ):
-        result = UploadImagesToGcs().upload([_image(), _image()], WEBHOOK_URL, "tok", format="jpeg")
+        result = UploadImagesToGcs().upload(
+            [_image(), _image()], WEBHOOK_URL, "tok", format="jpeg", task_id="t-1"
+        )
     assert result == {"ui": {"object_key": keys}}
-    first, second = post.call_args_list
-    assert first.kwargs["json"]["event"] == "request_urls"
-    assert first.kwargs["json"]["count"] == 2
-    assert first.kwargs["json"]["content_type"] == "image/jpeg"
-    assert second.kwargs["json"] == {"token": "tok", "event": "completed", "object_keys": keys}
+    assert _events(post) == ["log", "request_urls", "log", "log", "completed"]
+    assert _stages(post) == ["node.started", "node.uploaded", "node.uploaded"]
+    request = post.call_args_list[1].kwargs["json"]
+    assert request["count"] == 2
+    assert request["content_type"] == "image/jpeg"
+    uploaded = post.call_args_list[2].kwargs["json"]["fields"]
+    assert uploaded["object_key"] == "req/0.png"
+    assert uploaded["task_id"] == "t-1"
+    assert uploaded["bytes"] > 0
+    assert post.call_args_list[4].kwargs["json"] == {
+        "token": "tok",
+        "event": "completed",
+        "object_keys": keys,
+    }
     assert [c.args[0] for c in put.call_args_list] == urls
     assert all(c.kwargs["headers"] == {"Content-Type": "image/jpeg"} for c in put.call_args_list)
 
@@ -260,20 +314,47 @@ def test_node_does_not_upload_when_request_urls_fails():
     ):
         UploadImagesToGcs().upload([_image()], WEBHOOK_URL, "tok")
     put.assert_not_called()
-    post.assert_called_once()  # no "completed" callback either
+    assert _events(post) == ["log", "request_urls", "log"]  # no "completed" callback
+    assert _stages(post) == ["node.started", "node.failed"]
+    assert post.call_args_list[-1].kwargs["json"]["level"] == "error"
 
 
 def test_node_does_not_report_completed_when_upload_fails():
     with (
         NO_SLEEP,
         mock.patch.object(
-            requests, "post", return_value=_urls_ok(["req/0.png"], ["https://u"])
+            requests,
+            "post",
+            side_effect=[_response(200), _urls_ok(["req/0.png"], ["https://u"]), _response(200)],
         ) as post,
         mock.patch.object(requests, "put", return_value=_response(403)),
         pytest.raises(GcsUploadError, match=r"image #0 \(req/0.png\)"),
     ):
         UploadImagesToGcs().upload([_image()], WEBHOOK_URL, "tok")
-    assert [c.kwargs["json"]["event"] for c in post.call_args_list] == ["request_urls"]
+    assert _events(post) == ["log", "request_urls", "log"]
+    assert _stages(post) == ["node.started", "node.failed"]
+    assert "req/0.png" in post.call_args_list[-1].kwargs["json"]["message"]
+
+
+def test_node_log_failure_does_not_break_upload():
+    keys, urls = ["req/0.png"], ["https://u"]
+    with (
+        NO_SLEEP,
+        mock.patch.object(
+            requests,
+            "post",
+            side_effect=[
+                requests.ConnectionError("log down"),
+                _urls_ok(keys, urls),
+                requests.ConnectionError("log down"),
+                _response(200),
+            ],
+        ),
+        mock.patch.object(requests, "put", return_value=_response(200)),
+    ):
+        assert UploadImagesToGcs().upload([_image()], WEBHOOK_URL, "tok") == {
+            "ui": {"object_key": keys}
+        }
 
 
 def test_node_metadata_matches_comfy_conventions():
