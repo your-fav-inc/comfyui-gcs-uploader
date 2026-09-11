@@ -37,7 +37,7 @@ Python ≥ 3.9. No `pip install` step is needed on a stock ComfyUI environment.
 | Input             | Type     | Notes                                                                                   |
 | ----------------- | -------- | --------------------------------------------------------------------------------------- |
 | `images`          | `IMAGE`  | Batch of `[B, H, W, C]`. One upload per image.                                          |
-| `webhook_url`     | `STRING` | Backend endpoint that receives both events below. Injected by the caller per job.       |
+| `webhook_url`     | `STRING` | Backend endpoint that receives the events below, **without** `https://` (see note). Injected by the caller per job. |
 | `token`           | `STRING` | Per-task token issued by the backend at submit time (short TTL, limited uses). Injected per job. |
 | `format`          | enum     | `png` (default) / `jpeg` / `webp`. Determines the `Content-Type` sent to the backend and to GCS. |
 | `quality`         | `INT`    | Optional, `jpeg`/`webp` only. Default 95.                                               |
@@ -57,6 +57,11 @@ ComfyUI history (and any wrapper that forwards it) as:
 
 > ComfyUI flattens every `ui` value into a list, so `object_key` is **always a list**, even for a
 > single image.
+
+> **Why no scheme?** RunComfy (and similar runners) treat any `http(s)://` string in `overrides`
+> as a media input: they download it and replace the value with a local temp path such as
+> `.serverless/tmpXXXX.html`. Pass `api.example.com/webhooks/comfy-upload` instead; the node
+> prepends `https://`. A value that already has a scheme is used as-is (handy for local `http://`).
 
 ## Webhook protocol
 
@@ -138,7 +143,7 @@ def sign_put(object_key: str, content_type: str) -> str:
 overrides = {
     NODE_ID: {
         "inputs": {
-            "webhook_url": "https://api.example.com/webhooks/comfy-upload",
+            "webhook_url": "api.example.com/webhooks/comfy-upload",  # no scheme, see note above
             "token": task_token,
             "format": "png",
         }

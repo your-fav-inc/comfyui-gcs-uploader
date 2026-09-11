@@ -125,6 +125,26 @@ def _pick(payload: dict[str, Any], *names: str) -> Any:
     return None
 
 
+def normalize_webhook_url(raw: str) -> str:
+    """Accept ``host/path`` without a scheme and assume ``https://``.
+
+    RunComfy treats any ``http(s)://`` string in ``overrides`` as a media input: it downloads it and
+    replaces the value with a local temp path (``.serverless/tmpXXXX.html``). Callers therefore send
+    the webhook without a scheme; the node restores it here.
+    """
+    url = raw.strip()
+    if not url:
+        raise GcsUploadError("'webhook_url' must not be empty")
+    if url.startswith(".serverless/") or url.startswith("/"):
+        raise GcsUploadError(
+            f"'webhook_url' looks like a local path ({url!r}); the runner rewrote it. "
+            "Send the URL without the https:// scheme so it is not treated as a media input."
+        )
+    if "://" not in url:
+        url = f"https://{url}"
+    return url
+
+
 def _post_webhook(
     webhook_url: str,
     body: dict[str, Any],
@@ -132,8 +152,7 @@ def _post_webhook(
     timeout_s: float,
     sleep: Callable[[float], None],
 ) -> requests.Response:
-    if not webhook_url.strip():
-        raise GcsUploadError("'webhook_url' must not be empty")
+    webhook_url = normalize_webhook_url(webhook_url)
     if not str(body.get("token", "")).strip():
         raise GcsUploadError("'token' must not be empty")
     return _request_with_retry(
@@ -222,7 +241,7 @@ def log_event(
     # logging must never fail the prompt
     with contextlib.suppress(Exception):
         requests.post(
-            webhook_url,
+            normalize_webhook_url(webhook_url),
             json=body,
             headers={"Content-Type": "application/json"},
             timeout=timeout_s,
@@ -265,8 +284,9 @@ class UploadImagesToGcs:
                     "STRING",
                     {
                         "default": "",
-                        "tooltip": "Backend endpoint receiving JSON POSTs: "
-                        "event=request_urls (returns signed PUT URLs) and event=completed.",
+                        "tooltip": "Backend endpoint receiving JSON POSTs (event=request_urls / "
+                        "completed / log). Pass it WITHOUT https:// so the runner does not treat "
+                        "it as a media URL; the node adds the scheme.",
                     },
                 ),
                 "token": (

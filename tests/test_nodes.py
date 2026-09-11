@@ -14,6 +14,7 @@ from nodes import (
     UploadImagesToGcs,
     encode_image,
     log_event,
+    normalize_webhook_url,
     put_with_retry,
     report_completed,
     request_upload_urls,
@@ -72,6 +73,34 @@ def test_encode_accepts_torch_like_tensor():
 
     data = encode_image(FakeTensor(_image()), "png", quality=95)
     assert Image.open(io.BytesIO(data)).size == (6, 4)
+
+
+# --- normalize_webhook_url ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("api.example/webhooks/comfy-upload", "https://api.example/webhooks/comfy-upload"),
+        ("  api.example/x ", "https://api.example/x"),
+        ("https://api.example/x", "https://api.example/x"),
+        ("http://localhost:8080/x", "http://localhost:8080/x"),
+    ],
+)
+def test_normalize_adds_https_when_scheme_missing(raw, expected):
+    assert normalize_webhook_url(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", "   ", ".serverless/tmp123.html", "/tmp/x.html"])
+def test_normalize_rejects_empty_or_runner_rewritten_paths(raw):
+    with pytest.raises(GcsUploadError):
+        normalize_webhook_url(raw)
+
+
+def test_request_urls_posts_to_scheme_restored_url():
+    with mock.patch.object(requests, "post", return_value=_urls_ok(["k0"], ["u0"])) as post:
+        request_upload_urls("api.example/hook", "tok", 1, "image/png", sleep=lambda _: None)
+    assert post.call_args.args[0] == "https://api.example/hook"
 
 
 # --- request_upload_urls -----------------------------------------------------
